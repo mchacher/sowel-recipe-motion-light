@@ -1,0 +1,17 @@
+{
+  "id": "motion-light",
+  "type": "recipe",
+  "name": "Motion Light",
+  "version": "1.0.0",
+  "description": "Turns on lights when motion is detected, turns off after a timeout with no motion",
+  "icon": "Lightbulb",
+  "repo": "mchacher/sowel-recipe-motion-light",
+  "author": "mchacher",
+  "tags": ["automation", "motion", "light"],
+  "i18n": {
+    "fr": {
+      "name": "Lumière sur mouvement",
+      "description": "Allume les lumières sur détection de mouvement, éteint après un délai sans mouvement."
+    }
+  }
+}
