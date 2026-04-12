@@ -7,11 +7,16 @@
   "icon": "Lightbulb",
   "repo": "mchacher/sowel-recipe-motion-light",
   "author": "mchacher",
-  "tags": ["automation", "motion", "light"],
+  "tags": [
+    "automation",
+    "motion",
+    "light"
+  ],
   "i18n": {
     "fr": {
       "name": "Lumière sur mouvement",
       "description": "Allume les lumières sur détection de mouvement, éteint après un délai sans mouvement."
     }
-  }
+  },
+  "sowelVersion": ">=0.10.0"
 }
