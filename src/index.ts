@@ -100,6 +100,13 @@ const ROOT_ZONE_ID = "00000000-0000-0000-0000-000000000001";
  *  Turn-on: lux <= threshold.  Turn-off: lux > threshold * (1 + factor). */
 const LUX_HYSTERESIS_FACTOR = 0.1;
 
+/**
+ * After the recipe sends an OFF order, ignore for this many ms any echo or
+ * downstream zone event that might re-trigger a turn-on. Has to cover the
+ * MQTT round-trip from the bulb. 2s is plenty for zigbee2mqtt.
+ */
+const TURN_OFF_GRACE_MS = 2000;
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -478,7 +485,7 @@ export function createRecipe(): RecipeDefinition {
 
       function turnOff(reason: string): void {
         lightsOnByRecipe = false;
-        turnOffGraceUntil = Date.now() + 5000;
+        turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
         const errors = ctx.helpers.turnOffLights(lightIds, ctx);
         if (errors.length > 0) {
           ctx.log(`Error turning off some lights: ${errors.join("; ")}`, "error");
@@ -491,7 +498,7 @@ export function createRecipe(): RecipeDefinition {
 
       function turnOffFailsafe(): void {
         lightsOnByRecipe = false;
-        turnOffGraceUntil = Date.now() + 5000;
+        turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
         const errors = ctx.helpers.turnOffLights(lightIds, ctx);
         if (errors.length > 0) {
           ctx.log(`Error turning off some lights: ${errors.join("; ")}`, "error");
@@ -555,7 +562,7 @@ export function createRecipe(): RecipeDefinition {
           clearOffTimerState();
           if (ctx.helpers.isAnyLightOn(lightIds, ctx)) {
             lightsOnByRecipe = false;
-            turnOffGraceUntil = Date.now() + 5000;
+            turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
             ctx.helpers.turnOffLights(lightIds, ctx);
           }
           clearOverrideMode();
@@ -610,13 +617,15 @@ export function createRecipe(): RecipeDefinition {
         }
 
         if (motion && !lightsOn) {
+          // Grace: a zone.data.changed (e.g. luminosity drop after we just sent
+          // OFF) can fire while motion is still cached as true. Without this
+          // guard the failsafe turn-off is immediately undone by the next
+          // motion-true event arriving on the OFF echo.
+          if (Date.now() < turnOffGraceUntil) return;
+
           // If recipe had turned lights on but they're now off -> manual turn-off
           if (lightsOnByRecipe) {
             lightsOnByRecipe = false;
-            // Grace period: recipe's own turnoff echo -> ignore
-            if (Date.now() < turnOffGraceUntil) {
-              return;
-            }
             // Manual turnoff while motion active -> override
             overrideMode = true;
             ctx.state.set("overrideMode", true);
@@ -663,9 +672,15 @@ export function createRecipe(): RecipeDefinition {
           cancelOffTimer();
           clearOffTimerState();
         } else if (!lightOn) {
+          // Grace: this OFF event is the echo of an order we just sent. Don't
+          // treat it as a manual/external action — that would (a) miss the
+          // override-mode case and (b) wipe a freshly armed failsafe if a
+          // re-light was triggered between our OFF and its echo.
+          if (Date.now() < turnOffGraceUntil) return;
+
           // Manual turn-off while motion active -> enter override mode
           // Must check BEFORE resetting lightsOnByRecipe
-          if (lightsOnByRecipe && motion && Date.now() >= turnOffGraceUntil) {
+          if (lightsOnByRecipe && motion) {
             lightsOnByRecipe = false;
             overrideMode = true;
             ctx.state.set("overrideMode", true);
@@ -696,7 +711,7 @@ export function createRecipe(): RecipeDefinition {
         if (stopped) return;
         if (ctx.helpers.isAnyLightOn(lightIds, ctx)) {
           lightsOnByRecipe = false;
-          turnOffGraceUntil = Date.now() + 5000;
+          turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
           const errors = ctx.helpers.turnOffLights(lightIds, ctx);
           if (errors.length > 0) {
             ctx.log(`Error turning off some lights: ${errors.join("; ")}`, "error");
