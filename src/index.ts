@@ -3,7 +3,7 @@
 // ============================================================
 
 // Minimal types for RecipeContext (injected at runtime by Sowel core)
-interface RecipeContext {
+export interface RecipeContext {
   eventBus: {
     onType(type: string, handler: (event: Record<string, unknown>) => void): () => void;
   };
@@ -15,11 +15,21 @@ interface RecipeContext {
       dataBindings: Array<{ alias: string }>;
       orderBindings: Array<{ alias: string; enumValues?: string[] }>;
     } | null;
-    getDataBindingsWithValues(id: string): Array<{ alias: string; category?: string; value: unknown }>;
+    getByZone(zoneId: string): Array<{ id: string; enabled: boolean }>;
+    getDataBindingsWithValues(
+      id: string,
+    ): Array<{
+      alias: string;
+      category?: string;
+      value: unknown;
+      deviceId?: string;
+      key?: string;
+    }>;
     executeOrder(equipmentId: string, alias: string, value: unknown): Promise<void>;
   };
   zoneManager: {
     getById(id: string): { id: string; name: string } | null;
+    getDescendantIds(id: string): string[];
   };
   zoneAggregator: {
     getByZoneId(zoneId: string): {
@@ -111,6 +121,52 @@ const TURN_OFF_GRACE_MS = 2000;
 // Helpers
 // ============================================================
 
+/** Join a device id + data key into a stable motion-source identity. */
+export function motionSourceKey(deviceId: string, key: string): string {
+  return `${deviceId} ${key}`;
+}
+
+/**
+ * A raw motion/occupancy value that indicates active presence. Mirrors the
+ * representations the core aggregator treats as "motion active".
+ */
+export function isMotionActive(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const s = String(value).trim().toLowerCase();
+  return s === "true" || s === "on" || s === "1" || s === "occupied" || s === "detected";
+}
+
+/**
+ * Resolve the (deviceId, key) of every motion data binding feeding the recipe's
+ * zone and its descendants. The failsafe is reset on each *raw* impulse from
+ * these sources (`device.data.updated`, which fires per message), not on the
+ * zone-aggregated motion value — with several PIRs OR-ed together the zone
+ * stays `true` without emitting a change while a person is active, which would
+ * otherwise let the max-on failsafe fire mid-presence. A genuinely stuck/dead
+ * sensor stops emitting impulses, so the failsafe still catches it.
+ */
+export function resolveMotionSources(ctx: RecipeContext, zoneId: string): Set<string> {
+  const sources = new Set<string>();
+  let zoneIds: string[];
+  try {
+    zoneIds = ctx.zoneManager.getDescendantIds(zoneId);
+  } catch {
+    zoneIds = [zoneId];
+  }
+  for (const zid of zoneIds) {
+    for (const eq of ctx.equipmentManager.getByZone(zid)) {
+      if (eq.enabled === false) continue;
+      for (const b of ctx.equipmentManager.getDataBindingsWithValues(eq.id)) {
+        if (b.category === "motion" && b.deviceId && b.key) {
+          sources.add(motionSourceKey(b.deviceId, b.key));
+        }
+      }
+    }
+  }
+  return sources;
+}
+
 function normalizeStringArray(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.filter((id): id is string => typeof id === "string");
@@ -170,7 +226,8 @@ function commonTrailingSlots(): RecipeSlotDef[] {
     {
       id: "maxOnDuration",
       name: "Safety Auto-off",
-      description: "Force lights off after this duration even with continued motion (failsafe)",
+      description:
+        "Failsafe for a stuck sensor: force lights off after this duration with no fresh motion. Active presence keeps resetting it, so it won't cut the light while you're in the room.",
       type: "duration",
       required: false,
     },
@@ -245,7 +302,8 @@ export function createRecipe(): RecipeDefinition {
           },
           maxOnDuration: {
             name: "Extinction auto (sécurité)",
-            description: "Coupe les lumières après cette durée même avec mouvement — anti-oubli",
+            description:
+              "Anti-oubli pour capteur bloqué : coupe les lumières après cette durée sans nouveau mouvement. Une présence active la réarme en continu, donc elle ne coupe pas tant que tu es dans la pièce.",
           },
           buttons: {
             name: "Interrupteurs",
@@ -375,6 +433,9 @@ export function createRecipe(): RecipeDefinition {
       let turnOffGraceUntil = 0;
       /** Defence flag: set by stop(), checked by all event handlers to prevent orphaned execution */
       let stopped = false;
+      /** (deviceId, key) of the motion sensors feeding this zone — resolved once
+       *  at start. Each raw impulse from these resets the failsafe. */
+      const motionSources = maxOnDurationMs !== null ? resolveMotionSources(ctx, zoneId) : new Set<string>();
 
       // Clear any stale state from previous run
       ctx.state.delete("overrideMode");
@@ -764,6 +825,27 @@ export function createRecipe(): RecipeDefinition {
         onZoneChanged(aggregatedData.motion, aggregatedData.luminosity);
       });
       unsubs.push(unsubZone);
+
+      // Listen to raw motion impulses (per device message, not deduped) to keep
+      // the failsafe at bay while a person is genuinely present. The zone OR can
+      // stay `true` without re-emitting a change (several PIRs covering the
+      // room), so resetting the failsafe only on zone changes let it fire mid
+      // presence. A stuck/dead sensor emits no more impulses, so the failsafe
+      // still triggers — that is the whole point of the safety auto-off.
+      if (motionSources.size > 0) {
+        const unsubImpulse = ctx.eventBus.onType("device.data.updated", (event) => {
+          if (stopped) return;
+          const deviceId = event.deviceId as string;
+          const key = event.key as string;
+          if (!deviceId || !key) return;
+          if (!motionSources.has(motionSourceKey(deviceId, key))) return;
+          if (!isMotionActive(event.value)) return;
+          // Fresh evidence of presence. resetFailsafeTimer is a no-op when no
+          // failsafe is armed (lights off, or maxOnDuration disabled).
+          resetFailsafeTimer();
+        });
+        unsubs.push(unsubImpulse);
+      }
 
       // Listen to light state changes (for manual on/off)
       const unsubLight = ctx.eventBus.onType("equipment.data.changed", (event) => {
