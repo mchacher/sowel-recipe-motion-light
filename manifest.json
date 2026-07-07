@@ -2,7 +2,7 @@
   "id": "motion-light",
   "type": "recipe",
   "name": "Motion Light",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Turns on lights when motion is detected, turns off after a timeout with no motion",
   "icon": "Lightbulb",
   "repo": "mchacher/sowel-recipe-motion-light",
