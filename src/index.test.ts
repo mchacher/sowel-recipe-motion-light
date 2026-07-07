@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  createRecipe,
   isMotionActive,
   motionSourceKey,
   resolveMotionSources,
@@ -80,5 +81,142 @@ describe("resolveMotionSources", () => {
     expect(sources.has(motionSourceKey("dev-0", "occupancy"))).toBe(true);
     expect(sources.has(motionSourceKey("dev-2", "presence"))).toBe(false);
     expect(sources.size).toBe(2);
+  });
+});
+
+// ============================================================
+// Regression: periodic state re-reports must not reset the off-timer
+// (a relay that re-publishes "state: ON" every 60s kept the light on forever)
+// ============================================================
+
+const ZONE = "zone-1";
+const LIGHT = "light-1";
+
+/** Minimal event/equipment harness driving a real recipe instance. */
+function makeInstanceHarness() {
+  const handlers: Record<string, Array<(e: Record<string, unknown>) => void>> = {};
+  let lightPhysicallyOn = false; // what the bulb reports
+  let motion = false;
+
+  const emit = (type: string, event: Record<string, unknown>) => {
+    for (const h of handlers[type] ?? []) h(event);
+  };
+
+  const ctx = {
+    eventBus: {
+      onType(type: string, handler: (e: Record<string, unknown>) => void) {
+        (handlers[type] ??= []).push(handler);
+        return () => {
+          handlers[type] = (handlers[type] ?? []).filter((h) => h !== handler);
+        };
+      },
+    },
+    equipmentManager: {
+      getByIdWithDetails: () => ({
+        name: "Light",
+        type: "light_onoff",
+        zoneId: ZONE,
+        dataBindings: [{ alias: "state" }],
+        orderBindings: [{ alias: "state" }],
+      }),
+      getByZone: () => [],
+      getDataBindingsWithValues: () => [],
+      executeOrder: async () => {},
+    },
+    zoneManager: {
+      getById: () => ({ id: ZONE, name: "Zone" }),
+      getDescendantIds: (id: string) => [id],
+    },
+    zoneAggregator: {
+      getByZoneId: () => ({ motion, motionSensors: 1, luminosity: null, isDaylight: null }),
+    },
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    state: (() => {
+      const m = new Map<string, unknown>();
+      return {
+        get: (k: string) => (m.has(k) ? m.get(k) : null),
+        set: (k: string, v: unknown) => void m.set(k, v),
+        delete: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+      };
+    })(),
+    log: () => {},
+    helpers: {
+      isAnyLightOn: () => lightPhysicallyOn,
+      turnOnLights: () => {
+        lightPhysicallyOn = true;
+        return [];
+      },
+      turnOffLights: () => {
+        lightPhysicallyOn = false;
+        return [];
+      },
+      setLightsBrightness: () => [],
+      parseDuration: (v: unknown) => {
+        const m = /^(\d+)(s|m|h)$/.exec(String(v));
+        if (!m) throw new Error(`bad duration: ${String(v)}`);
+        const n = Number(m[1]);
+        return m[2] === "s" ? n * 1000 : m[2] === "m" ? n * 60000 : n * 3600000;
+      },
+      formatDuration: (ms: number) => `${ms}ms`,
+    },
+  } as unknown as RecipeContext;
+
+  return {
+    ctx,
+    isLightOn: () => lightPhysicallyOn,
+    setMotion: (v: boolean) => {
+      motion = v;
+    },
+    /** Simulate the bulb publishing its state (value unchanged = a heartbeat). */
+    reportLight(on: boolean) {
+      lightPhysicallyOn = on;
+      emit("equipment.data.changed", { equipmentId: LIGHT, alias: "state", value: on ? "ON" : "OFF" });
+    },
+  };
+}
+
+describe("periodic light-state re-reports (regression)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("arms the off-timer once on external ON and turns off after timeout despite ON heartbeats", () => {
+    const h = makeInstanceHarness();
+    const inst = createRecipe().createInstance(
+      { zone: ZONE, lights: [LIGHT], timeout: "2m" },
+      h.ctx,
+    );
+
+    // Light turns on externally, no motion -> off-timer armed for 2m.
+    h.reportLight(true);
+    expect(h.isLightOn()).toBe(true);
+
+    // 1 minute passes, then the bulb re-publishes "ON" (a heartbeat).
+    vi.advanceTimersByTime(60_000);
+    h.reportLight(true); // <-- must be ignored, must NOT reset the 2m countdown
+    vi.advanceTimersByTime(60_000);
+
+    // 2 minutes total since the real turn-on -> light must be OFF.
+    expect(h.isLightOn()).toBe(false);
+    inst.stop();
+  });
+
+  it("a genuine OFF then ON transition is still honoured", () => {
+    const h = makeInstanceHarness();
+    const inst = createRecipe().createInstance(
+      { zone: ZONE, lights: [LIGHT], timeout: "2m" },
+      h.ctx,
+    );
+
+    h.reportLight(true); // external ON -> 2m countdown
+    vi.advanceTimersByTime(130_000); // elapse -> off
+    expect(h.isLightOn()).toBe(false);
+
+    h.reportLight(true); // a NEW external ON (real transition) -> fresh 2m
+    vi.advanceTimersByTime(60_000);
+    h.reportLight(true); // heartbeat, ignored
+    vi.advanceTimersByTime(60_000);
+    expect(h.isLightOn()).toBe(false); // off at 2m, heartbeat did not extend it
+    inst.stop();
   });
 });

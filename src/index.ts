@@ -429,6 +429,12 @@ export function createRecipe(): RecipeDefinition {
       const unsubs: (() => void)[] = [];
       let overrideMode = false;
       let lightsOnByRecipe = ctx.helpers.isAnyLightOn(lightIds, ctx);
+      /** Last on/off light state the recipe has observed. Guards against devices
+       *  that periodically re-publish an unchanged state (e.g. a relay reporting
+       *  "state: ON" every 60s): such a re-report must not be treated as a fresh
+       *  external turn-on, which would keep resetting the off-timer and stop the
+       *  light from ever switching off. */
+      let lastKnownLightOn = lightsOnByRecipe;
       /** Grace period: ignore light-off echoes for 5s after the recipe itself sends a turnOff */
       let turnOffGraceUntil = 0;
       /** Defence flag: set by stop(), checked by all event handlers to prevent orphaned execution */
@@ -540,12 +546,14 @@ export function createRecipe(): RecipeDefinition {
 
       function turnOn(): void {
         lightsOnByRecipe = true;
+        lastKnownLightOn = true;
         doTurnOn();
         startFailsafeTimer();
       }
 
       function turnOff(reason: string): void {
         lightsOnByRecipe = false;
+        lastKnownLightOn = false;
         turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
         const errors = ctx.helpers.turnOffLights(lightIds, ctx);
         if (errors.length > 0) {
@@ -559,6 +567,7 @@ export function createRecipe(): RecipeDefinition {
 
       function turnOffFailsafe(): void {
         lightsOnByRecipe = false;
+        lastKnownLightOn = false;
         turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
         const errors = ctx.helpers.turnOffLights(lightIds, ctx);
         if (errors.length > 0) {
@@ -623,6 +632,7 @@ export function createRecipe(): RecipeDefinition {
           clearOffTimerState();
           if (ctx.helpers.isAnyLightOn(lightIds, ctx)) {
             lightsOnByRecipe = false;
+            lastKnownLightOn = false;
             turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
             ctx.helpers.turnOffLights(lightIds, ctx);
           }
@@ -650,7 +660,9 @@ export function createRecipe(): RecipeDefinition {
             clearOffTimerState();
             resetFailsafeTimer();
             ctx.log("Motion detected but override mode active — ignoring");
-          } else {
+          } else if (!offTimer) {
+            // Same edge-only guard as auto mode: arm the override-clear timer
+            // once when motion ends, not on every subsequent no-motion event.
             startOffTimerForOverrideClear();
           }
           return;
@@ -713,16 +725,30 @@ export function createRecipe(): RecipeDefinition {
           clearOffTimerState();
           resetFailsafeTimer();
         } else if (!motion && lightsOn) {
-          startOffTimer();
+          // Only arm on the motion true->false edge, not on every zone event
+          // while motion stays false. Otherwise unrelated zone data re-reports
+          // (temperature, humidity, luminosity) would keep resetting the
+          // countdown and the light would never turn off.
+          if (!offTimer) startOffTimer();
         }
         // !motion && !lightsOn -> nothing to do
       }
 
       function onLightChanged(value: unknown): void {
         if (stopped) return;
-        if (overrideMode) return;
 
         const lightOn = value === true || String(value).toUpperCase() === "ON";
+        // Ignore re-reports of the same state. Many devices periodically
+        // re-publish "state: ON" even when nothing changed; without this guard
+        // each heartbeat was treated as a fresh external turn-on and reset the
+        // off-timer, so the light never switched off. Only real on/off
+        // transitions drive the recipe. (State is still tracked in override
+        // mode so it stays accurate when override later clears.)
+        if (lightOn === lastKnownLightOn) return;
+        lastKnownLightOn = lightOn;
+
+        if (overrideMode) return;
+
         const motion = hasMotion();
 
         if (lightOn && !motion) {
@@ -772,6 +798,7 @@ export function createRecipe(): RecipeDefinition {
         if (stopped) return;
         if (ctx.helpers.isAnyLightOn(lightIds, ctx)) {
           lightsOnByRecipe = false;
+          lastKnownLightOn = false;
           turnOffGraceUntil = Date.now() + TURN_OFF_GRACE_MS;
           const errors = ctx.helpers.turnOffLights(lightIds, ctx);
           if (errors.length > 0) {
