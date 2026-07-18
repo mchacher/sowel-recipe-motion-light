@@ -368,7 +368,7 @@ export function createRecipe(): RecipeDefinition {
       ctx.helpers.parseDuration(timeoutValue);
 
       // Validate luxThreshold
-      if (luxThreshold !== undefined && luxThreshold !== null) {
+      if (luxThreshold !== undefined && luxThreshold !== null && luxThreshold !== "") {
         const lux = Number(luxThreshold);
         if (isNaN(lux) || lux < 0) {
           throw new Error("luxThreshold must be a non-negative number");
@@ -409,7 +409,9 @@ export function createRecipe(): RecipeDefinition {
       const lightIds = normalizeLights(params);
       const timeoutMs = ctx.helpers.parseDuration(params.timeout || "10m");
       const luxThreshold =
-        params.luxThreshold !== undefined && params.luxThreshold !== null
+        params.luxThreshold !== undefined &&
+        params.luxThreshold !== null &&
+        params.luxThreshold !== ""
           ? Number(params.luxThreshold)
           : null;
       const maxOnDurationMs =

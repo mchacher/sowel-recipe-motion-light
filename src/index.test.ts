@@ -168,6 +168,9 @@ function makeInstanceHarness() {
     setMotion: (v: boolean) => {
       motion = v;
     },
+    emitZone(aggregatedData: Record<string, unknown>) {
+      emit("zone.data.changed", { zoneId: ZONE, aggregatedData });
+    },
     /** Simulate the bulb publishing its state (value unchanged = a heartbeat). */
     reportLight(on: boolean) {
       lightPhysicallyOn = on;
@@ -217,6 +220,40 @@ describe("periodic light-state re-reports (regression)", () => {
     h.reportLight(true); // heartbeat, ignored
     vi.advanceTimersByTime(60_000);
     expect(h.isLightOn()).toBe(false); // off at 2m, heartbeat did not extend it
+    inst.stop();
+  });
+});
+
+describe("empty lux threshold (issue #307 regression)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("an empty lux field is treated as 'no threshold', not 0, so a luminosity-reporting sensor still turns on", () => {
+    const h = makeInstanceHarness();
+    // Empty SEUIL LUX from the UI arrives as "" — Number("") is 0, which used to
+    // block any sensor reporting >0 lx (e.g. Sonoff SNZB-03PR2 at 1 lx) while a
+    // motion-only sensor (luminosity null) worked.
+    const inst = createRecipe().createInstance(
+      { zone: ZONE, lights: [LIGHT], timeout: "2m", luxThreshold: "" },
+      h.ctx,
+    );
+    expect(h.isLightOn()).toBe(false);
+
+    h.emitZone({ motion: true, luminosity: 1 });
+
+    expect(h.isLightOn()).toBe(true);
+    inst.stop();
+  });
+
+  it("a real lux threshold still blocks turn-on above it", () => {
+    const h = makeInstanceHarness();
+    const inst = createRecipe().createInstance(
+      { zone: ZONE, lights: [LIGHT], timeout: "2m", luxThreshold: 50 },
+      h.ctx,
+    );
+
+    h.emitZone({ motion: true, luminosity: 120 }); // brighter than 50 -> stay off
+    expect(h.isLightOn()).toBe(false);
     inst.stop();
   });
 });
